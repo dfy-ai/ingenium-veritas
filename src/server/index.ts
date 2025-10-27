@@ -1,4 +1,6 @@
 // src/server/index.ts
+import { ChatMessage } from "./shared";
+
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -19,12 +21,11 @@ interface Env {
 
 interface SessionData {
   sessionId: string;
-  queries: Array<{ query: string; answer: string; timestamp: number }>;
-  followUps: Array<{ query: string; answer: string; timestamp: number }>;
+  messages: ChatMessage[];
   created: number;
 }
 
-export class Chat implements DurableObject {
+export class ingeniumVeritasChat implements DurableObject {
   constructor(private state: DurableObjectState, private env: Env) {}
 
   async normalizeQuery(query: string): Promise<string> {
@@ -39,7 +40,7 @@ export class Chat implements DurableObject {
       .substring(0, 100);
   }
 
-  async callModel(modelKey: string, prompt: string, input?: any): Promise<{ answer: string }> {
+  async callModel(modelKey: string, prompt: string): Promise<{ answer: string }> {
     if (modelKey === "WORKERS_AI") {
       if (!this.env.AI) throw new Error("AI binding not found.");
       const response = await this.env.AI.run(MODELS.WORKERS_AI.model, { prompt });
@@ -68,22 +69,20 @@ export class Chat implements DurableObject {
     }
   }
 
-  async addFollowUp(query: string, answer: string, sessionId: string) {
+  async addMessage(message: ChatMessage, sessionId: string) {
     const session: SessionData = (await this.state.storage.get(`session:${sessionId}`)) || {
       sessionId,
-      queries: [],
-      followUps: [],
+      messages: [],
       created: Date.now(),
     };
-    session.followUps.push({ query, answer, timestamp: Date.now() });
+    session.messages.push(message);
     await this.state.storage.put(`session:${sessionId}`, session);
   }
 
   async getHistory(sessionId: string): Promise<SessionData> {
     return (await this.state.storage.get(`session:${sessionId}`)) || {
       sessionId,
-      queries: [],
-      followUps: [],
+      messages: [],
       created: Date.now(),
     };
   }
@@ -119,11 +118,14 @@ export class Chat implements DurableObject {
     const path = url.pathname;
     const sessionId = url.searchParams.get("sessionId") || crypto.randomUUID();
 
-    // Conversation endpoints (truthengine)
+    // Conversation endpoints
     if (path === "/conversation/add" && request.method === "POST") {
       try {
         const { query, answer } = await request.json();
-        await this.addFollowUp(query, answer, sessionId);
+        const message: ChatMessage = { id: crypto.randomUUID(), content: query, user: "user", role: "user" };
+        const responseMessage: ChatMessage = { id: crypto.randomUUID(), content: answer, user: "ai", role: "assistant" };
+        await this.addMessage(message, sessionId);
+        await this.addMessage(responseMessage, sessionId);
         return new Response(JSON.stringify({ success: true }), { headers: CORS_HEADERS });
       } catch (error) {
         return new Response(JSON.stringify({ error: (error as Error).message }), { status: 400, headers: CORS_HEADERS });
@@ -187,17 +189,16 @@ export class Chat implements DurableObject {
           timestamp: Date.now(),
           created: Date.now(),
         };
-        // Preserve created timestamp
         const existingData = await this.env.memy.get(cacheKey);
         if (existingData) {
           cacheData.created = JSON.parse(existingData).created;
         }
         await this.env.memy.put(cacheKey, JSON.stringify(cacheData));
-        // Update session in DO
         const session = await this.getHistory(sessionId);
-        session.queries.push({ query, answer, timestamp: Date.now() });
-        await this.state.storage.put(`session:${sessionId}`, session);
-        // Track query count
+        const message: ChatMessage = { id: crypto.randomUUID(), content: query, user: editor || "user", role: "user" };
+        const responseMessage: ChatMessage = { id: crypto.randomUUID(), content: answer, user: "ai", role: "assistant" };
+        await this.addMessage(message, sessionId);
+        await this.addMessage(responseMessage, sessionId);
         const queryCount = await this.env.memy.get(`count:${normalizedQuery}`);
         const newCount = queryCount ? parseInt(queryCount) + 1 : 1;
         await this.env.memy.put(`count:${normalizedQuery}`, newCount.toString());
@@ -222,23 +223,28 @@ export class Chat implements DurableObject {
         }
         const normalizedQuery = await this.normalizeQuery(query);
         const cacheKey = `truth:${normalizedQuery}`;
-        // Check cache first
         const cached = await this.env.memy.get(`cache:${normalizedQuery}`);
         if (cached) {
           const session = await this.getHistory(sessionId);
-          session.queries.push({ query, answer: JSON.parse(cached).answer, timestamp: Date.now() });
-          await this.state.storage.put(`session:${sessionId}`, session);
+          const message: ChatMessage = { id: crypto.randomUUID(), content: query, user: "user", role: "user" };
+          const responseMessage: ChatMessage = {
+            id: crypto.randomUUID(),
+            content: JSON.parse(cached).answer,
+            user: "ai",
+            role: "assistant",
+          };
+          await this.addMessage(message, sessionId);
+          await this.addMessage(responseMessage, sessionId);
           return new Response(JSON.stringify({ answer: JSON.parse(cached).answer, sessionId }), {
             headers: CORS_HEADERS,
           });
         }
-        // Get session for follow-up context
         const session = await this.getHistory(sessionId);
+        const recentMessages = session.messages.slice(-2).filter((m) => m.role === "assistant");
         const prompt = isFollowUp
-          ? `Context: ${JSON.stringify(session.followUps.slice(-2))}\nQuery: ${query}`
+          ? `Context: ${JSON.stringify(recentMessages.map((m) => ({ role: m.role, content: m.content })))}\nQuery: ${query}`
           : query;
         const aiResponse = await this.callModel("WORKERS_AI", prompt);
-        // Log query to memy
         const cacheData = {
           answer: aiResponse.answer,
           lastEditedBy: "ai",
@@ -247,15 +253,15 @@ export class Chat implements DurableObject {
           created: Date.now(),
         };
         await this.env.memy.put(cacheKey, JSON.stringify(cacheData));
-        // Update session
-        const entry = { query, answer: aiResponse.answer, timestamp: Date.now() };
-        if (isFollowUp) {
-          session.followUps.push(entry);
-        } else {
-          session.queries.push(entry);
-        }
-        await this.state.storage.put(`session:${sessionId}`, session);
-        // Update query count for caching
+        const message: ChatMessage = { id: crypto.randomUUID(), content: query, user: "user", role: "user" };
+        const responseMessage: ChatMessage = {
+          id: crypto.randomUUID(),
+          content: aiResponse.answer,
+          user: "ai",
+          role: "assistant",
+        };
+        await this.addMessage(message, sessionId);
+        await this.addMessage(responseMessage, sessionId);
         const queryCount = await this.env.memy.get(`count:${normalizedQuery}`);
         const newCount = queryCount ? parseInt(queryCount) + 1 : 1;
         await this.env.memy.put(`count:${normalizedQuery}`, newCount.toString());
@@ -268,10 +274,10 @@ export class Chat implements DurableObject {
       }
     }
 
-    // New endpoint: Top queries per day
+    // Top queries per day
     if (path === "/top-queries" && request.method === "GET") {
       try {
-        const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+        const today = new Date().toISOString().split("T")[0];
         const keys = await this.env.memy.list({ prefix: `count:` });
         const topQueries = [];
         for (const key of keys.keys) {
