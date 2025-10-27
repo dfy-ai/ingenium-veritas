@@ -1,87 +1,308 @@
-import {
-	type Connection,
-	Server,
-	type WSMessage,
-	routePartykitRequest,
-} from "partyserver";
+// src/server/index.ts
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
 
-import type { ChatMessage, Message } from "../shared";
+const MODELS = {
+  WORKERS_AI: { model: "@cf/llama-3" }, // Adjust as needed
+};
 
-export class Chat extends Server<Env> {
-	static options = { hibernate: true };
+interface Env {
+  Chat: DurableObjectNamespace;
+  memy: KVNamespace;
+  AI: any;
+  OPENROUTER_API_KEY?: string;
+  ASSETS: Fetcher;
+}
 
-	messages = [] as ChatMessage[];
+interface SessionData {
+  sessionId: string;
+  queries: Array<{ query: string; answer: string; timestamp: number }>;
+  followUps: Array<{ query: string; answer: string; timestamp: number }>;
+  created: number;
+}
 
-	broadcastMessage(message: Message, exclude?: string[]) {
-		this.broadcast(JSON.stringify(message), exclude);
-	}
+export class Chat implements DurableObject {
+  constructor(private state: DurableObjectState, private env: Env) {}
 
-	onStart() {
-		// this is where you can initialize things that need to be done before the server starts
-		// for example, load previous messages from a database or a service
+  async normalizeQuery(query: string): Promise<string> {
+    if (!query || typeof query !== "string") return "";
+    return query
+      .trim()
+      .toLowerCase()
+      .replace(/[^\w\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .substring(0, 100);
+  }
 
-		// create the messages table if it doesn't exist
-		this.ctx.storage.sql.exec(
-			`CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, user TEXT, role TEXT, content TEXT)`,
-		);
+  async callModel(modelKey: string, prompt: string, input?: any): Promise<{ answer: string }> {
+    if (modelKey === "WORKERS_AI") {
+      if (!this.env.AI) throw new Error("AI binding not found.");
+      const response = await this.env.AI.run(MODELS.WORKERS_AI.model, { prompt });
+      return { answer: response.response };
+    } else {
+      if (!this.env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY secret not found.");
+      const modelConfig = MODELS[modelKey] || { model: modelKey };
+      const openRouterUrl = "https://openrouter.ai/api/v1/chat/completions";
+      const response = await fetch(openRouterUrl, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${this.env.OPENROUTER_API_KEY}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://ingenium-veritas.com",
+          "X-Title": "Ingenium Veritas",
+        },
+        body: JSON.stringify({
+          model: modelConfig.model,
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+      if (!response.ok) throw new Error(`OpenRouter error: ${response.status} ${await response.text()}`);
+      const data = await response.json();
+      if (!data.choices?.[0]?.message) throw new Error("Invalid OpenRouter response structure");
+      return { answer: data.choices[0].message.content };
+    }
+  }
 
-		// load the messages from the database
-		this.messages = this.ctx.storage.sql
-			.exec(`SELECT * FROM messages`)
-			.toArray() as ChatMessage[];
-	}
+  async addFollowUp(query: string, answer: string, sessionId: string) {
+    const session: SessionData = (await this.state.storage.get(`session:${sessionId}`)) || {
+      sessionId,
+      queries: [],
+      followUps: [],
+      created: Date.now(),
+    };
+    session.followUps.push({ query, answer, timestamp: Date.now() });
+    await this.state.storage.put(`session:${sessionId}`, session);
+  }
 
-	onConnect(connection: Connection) {
-		connection.send(
-			JSON.stringify({
-				type: "all",
-				messages: this.messages,
-			} satisfies Message),
-		);
-	}
+  async getHistory(sessionId: string): Promise<SessionData> {
+    return (await this.state.storage.get(`session:${sessionId}`)) || {
+      sessionId,
+      queries: [],
+      followUps: [],
+      created: Date.now(),
+    };
+  }
 
-	saveMessage(message: ChatMessage) {
-		// check if the message already exists
-		const existingMessage = this.messages.find((m) => m.id === message.id);
-		if (existingMessage) {
-			this.messages = this.messages.map((m) => {
-				if (m.id === message.id) {
-					return message;
-				}
-				return m;
-			});
-		} else {
-			this.messages.push(message);
-		}
+  async exportConversation(sessionId: string): Promise<Response> {
+    const session = await this.getHistory(sessionId);
+    return new Response(JSON.stringify(session, null, 2), {
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Disposition": `attachment; filename=session-${sessionId}.json`,
+      },
+    });
+  }
 
-		this.ctx.storage.sql.exec(
-			`INSERT INTO messages (id, user, role, content) VALUES ('${
-				message.id
-			}', '${message.user}', '${message.role}', ${JSON.stringify(
-				message.content,
-			)}) ON CONFLICT (id) DO UPDATE SET content = ${JSON.stringify(
-				message.content,
-			)}`,
-		);
-	}
+  async importConversation(jsonData: string, sessionId: string): Promise<Response> {
+    try {
+      const importedSession = JSON.parse(jsonData) as SessionData;
+      if (importedSession.sessionId !== sessionId) {
+        return new Response(JSON.stringify({ error: "Invalid session ID" }), { status: 400, headers: CORS_HEADERS });
+      }
+      await this.state.storage.put(`session:${sessionId}`, importedSession);
+      return new Response(JSON.stringify({ success: true, message: "Session imported" }), {
+        status: 200,
+        headers: CORS_HEADERS,
+      });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: "Invalid JSON format" }), { status: 400, headers: CORS_HEADERS });
+    }
+  }
 
-	onMessage(connection: Connection, message: WSMessage) {
-		// let's broadcast the raw message to everyone else
-		this.broadcast(message);
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const sessionId = url.searchParams.get("sessionId") || crypto.randomUUID();
 
-		// let's update our local messages store
-		const parsed = JSON.parse(message as string) as Message;
-		if (parsed.type === "add" || parsed.type === "update") {
-			this.saveMessage(parsed);
-		}
-	}
+    // Conversation endpoints (truthengine)
+    if (path === "/conversation/add" && request.method === "POST") {
+      try {
+        const { query, answer } = await request.json();
+        await this.addFollowUp(query, answer, sessionId);
+        return new Response(JSON.stringify({ success: true }), { headers: CORS_HEADERS });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: (error as Error).message }), { status: 400, headers: CORS_HEADERS });
+      }
+    }
+
+    if (path === "/conversation/history" && request.method === "GET") {
+      try {
+        const history = await this.getHistory(sessionId);
+        return new Response(JSON.stringify(history), { headers: CORS_HEADERS });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: (error as Error).message }), { status: 500, headers: CORS_HEADERS });
+      }
+    }
+
+    if (path === "/conversation/export" && request.method === "GET") {
+      return await this.exportConversation(sessionId);
+    }
+
+    if (path === "/conversation/import" && request.method === "POST") {
+      const jsonData = await request.text();
+      return await this.importConversation(jsonData, sessionId);
+    }
+
+    // Admin API endpoints (truthengine)
+    if (path === "/api/load" && request.method === "POST") {
+      try {
+        const body = await request.json();
+        const query = body.query;
+        if (!query) {
+          return new Response(JSON.stringify({ error: "Query is required" }), { status: 400, headers: CORS_HEADERS });
+        }
+        const normalizedQuery = await this.normalizeQuery(query);
+        const cacheKey = `truth:${normalizedQuery}`;
+        const data = await this.env.memy.get(cacheKey);
+        return new Response(JSON.stringify({ answer: data ? JSON.parse(data).answer : null }), {
+          status: 200,
+          headers: CORS_HEADERS,
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: (e as Error).message }), { status: 500, headers: CORS_HEADERS });
+      }
+    }
+
+    if (path === "/api/save" && request.method === "POST") {
+      try {
+        const body = await request.json();
+        const { query, answer, editor } = body;
+        if (!query || !answer) {
+          return new Response(JSON.stringify({ error: "query and answer are required" }), {
+            status: 400,
+            headers: CORS_HEADERS,
+          });
+        }
+        const normalizedQuery = await this.normalizeQuery(query);
+        const cacheKey = `truth:${normalizedQuery}`;
+        const cacheData = {
+          answer,
+          lastEditedBy: editor || "user",
+          edited: true,
+          timestamp: Date.now(),
+          created: Date.now(),
+        };
+        // Preserve created timestamp
+        const existingData = await this.env.memy.get(cacheKey);
+        if (existingData) {
+          cacheData.created = JSON.parse(existingData).created;
+        }
+        await this.env.memy.put(cacheKey, JSON.stringify(cacheData));
+        // Update session in DO
+        const session = await this.getHistory(sessionId);
+        session.queries.push({ query, answer, timestamp: Date.now() });
+        await this.state.storage.put(`session:${sessionId}`, session);
+        // Track query count
+        const queryCount = await this.env.memy.get(`count:${normalizedQuery}`);
+        const newCount = queryCount ? parseInt(queryCount) + 1 : 1;
+        await this.env.memy.put(`count:${normalizedQuery}`, newCount.toString());
+        if (newCount > 5) {
+          await this.env.memy.put(`cache:${normalizedQuery}`, JSON.stringify({ answer, timestamp: Date.now() }));
+        }
+        return new Response(JSON.stringify({ success: true, message: `Saved ${cacheKey}` }), {
+          status: 200,
+          headers: CORS_HEADERS,
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: (e as Error).message }), { status: 500, headers: CORS_HEADERS });
+      }
+    }
+
+    // Query with AI
+    if (path === "/query" && request.method === "POST") {
+      try {
+        const { query, isFollowUp } = await request.json();
+        if (!query) {
+          return new Response(JSON.stringify({ error: "Query is required" }), { status: 400, headers: CORS_HEADERS });
+        }
+        const normalizedQuery = await this.normalizeQuery(query);
+        const cacheKey = `truth:${normalizedQuery}`;
+        // Check cache first
+        const cached = await this.env.memy.get(`cache:${normalizedQuery}`);
+        if (cached) {
+          const session = await this.getHistory(sessionId);
+          session.queries.push({ query, answer: JSON.parse(cached).answer, timestamp: Date.now() });
+          await this.state.storage.put(`session:${sessionId}`, session);
+          return new Response(JSON.stringify({ answer: JSON.parse(cached).answer, sessionId }), {
+            headers: CORS_HEADERS,
+          });
+        }
+        // Get session for follow-up context
+        const session = await this.getHistory(sessionId);
+        const prompt = isFollowUp
+          ? `Context: ${JSON.stringify(session.followUps.slice(-2))}\nQuery: ${query}`
+          : query;
+        const aiResponse = await this.callModel("WORKERS_AI", prompt);
+        // Log query to memy
+        const cacheData = {
+          answer: aiResponse.answer,
+          lastEditedBy: "ai",
+          edited: false,
+          timestamp: Date.now(),
+          created: Date.now(),
+        };
+        await this.env.memy.put(cacheKey, JSON.stringify(cacheData));
+        // Update session
+        const entry = { query, answer: aiResponse.answer, timestamp: Date.now() };
+        if (isFollowUp) {
+          session.followUps.push(entry);
+        } else {
+          session.queries.push(entry);
+        }
+        await this.state.storage.put(`session:${sessionId}`, session);
+        // Update query count for caching
+        const queryCount = await this.env.memy.get(`count:${normalizedQuery}`);
+        const newCount = queryCount ? parseInt(queryCount) + 1 : 1;
+        await this.env.memy.put(`count:${normalizedQuery}`, newCount.toString());
+        if (newCount > 5) {
+          await this.env.memy.put(`cache:${normalizedQuery}`, JSON.stringify({ answer: aiResponse.answer, timestamp: Date.now() }));
+        }
+        return new Response(JSON.stringify({ answer: aiResponse.answer, sessionId }), { headers: CORS_HEADERS });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: (e as Error).message }), { status: 500, headers: CORS_HEADERS });
+      }
+    }
+
+    // New endpoint: Top queries per day
+    if (path === "/top-queries" && request.method === "GET") {
+      try {
+        const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+        const keys = await this.env.memy.list({ prefix: `count:` });
+        const topQueries = [];
+        for (const key of keys.keys) {
+          const count = parseInt(await this.env.memy.get(key.name) || "0");
+          const query = key.name.replace("count:", "");
+          const queryData = await this.env.memy.get(`truth:${query}`);
+          if (queryData) {
+            const { timestamp } = JSON.parse(queryData);
+            const queryDate = new Date(timestamp).toISOString().split("T")[0];
+            if (queryDate === today) {
+              topQueries.push({ query, count });
+            }
+          }
+        }
+        topQueries.sort((a, b) => b.count - a.count);
+        return new Response(JSON.stringify(topQueries.slice(0, 10)), { headers: CORS_HEADERS });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: (e as Error).message }), { status: 500, headers: CORS_HEADERS });
+      }
+    }
+
+    return new Response(JSON.stringify({ error: "Invalid endpoint" }), { status: 404, headers: CORS_HEADERS });
+  }
 }
 
 export default {
-	async fetch(request, env) {
-		return (
-			(await routePartykitRequest(request, { ...env })) ||
-			env.ASSETS.fetch(request)
-		);
-	},
-} satisfies ExportedHandler<Env>;
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    const sessionId = url.searchParams.get("sessionId") || crypto.randomUUID();
+    const chatId = env.Chat.idFromName(`ingenium-veritas:${sessionId}`);
+    const chatInstance = env.Chat.get(chatId);
+    return chatInstance.fetch(request);
+  },
+};
